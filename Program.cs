@@ -12,22 +12,20 @@ builder.WebHost.ConfigureKestrel(options =>
     options.Limits.MaxRequestBodySize = 12 * 1024 * 1024;
 });
 
-// SQL Server connection
+// PostgreSQL connection
 var connectionString =
     builder.Configuration.GetConnectionString("DefaultConnection");
 
 if (string.IsNullOrWhiteSpace(connectionString))
 {
     throw new InvalidOperationException(
-        "DefaultConnection is missing from appsettings.json.");
+        "DefaultConnection is missing from configuration.");
 }
 
-// Register the existing AppDbContext with SQL Server
-
+// Register PostgreSQL with EF Core
 builder.Services.AddDbContext<AppDbContext>(options =>
-    options.UseSqlServer(connectionString)
+    options.UseNpgsql(connectionString)
 );
-
 
 builder.Services.AddSingleton<ImportFileParser>();
 builder.Services.AddSingleton<ColumnMappingService>();
@@ -42,7 +40,7 @@ builder.Services.AddHttpClient<RxNormClient>(client =>
     client.Timeout = TimeSpan.FromSeconds(25);
 
     client.DefaultRequestHeaders.UserAgent.ParseAdd(
-        "MediDrift-LocalMVP/0.2"
+        "MediDrift-LocalMVP/0.3"
     );
 });
 
@@ -50,14 +48,22 @@ builder.Services.AddScoped<MedicationAuditService>();
 
 builder.Services.AddHostedService<MedicationAuditWorker>();
 
+// CORS configuration
+var allowedOrigins =
+    builder.Configuration
+        .GetSection("Cors:AllowedOrigins")
+        .Get<string[]>()
+    ?? new[]
+    {
+        "http://localhost:5173",
+        "http://127.0.0.1:5173"
+    };
+
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("LocalFrontend", policy =>
         policy
-            .WithOrigins(
-                "http://localhost:5173",
-                "http://127.0.0.1:5173"
-            )
+            .WithOrigins(allowedOrigins)
             .AllowAnyHeader()
             .AllowAnyMethod()
     );
@@ -102,13 +108,12 @@ app.Use(async (context, next) =>
     }
 });
 
-// Apply EF Core migrations and initialize workspace
+// Apply PostgreSQL EF Core migrations and initialize workspace
 await using (var scope = app.Services.CreateAsyncScope())
 {
     var db = scope.ServiceProvider
         .GetRequiredService<AppDbContext>();
 
-    // Creates or updates SQL Server tables using migrations.
     await db.Database.MigrateAsync();
 
     if (!await db.Workspaces.AnyAsync(
@@ -133,9 +138,7 @@ app.MapGet("/api/health", () => Results.Ok(new
 }));
 
 app.MapImportEndpoints();
-
 app.MapMappingProfileEndpoints();
-
 app.MapMedicationAuditEndpoints();
 
 app.Run();
