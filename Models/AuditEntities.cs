@@ -4,6 +4,8 @@ public static class MedicationAuditStatuses
 {
     public const string Queued = "Queued";
     public const string Running = "Running";
+    public const string Paused = "Paused";
+    public const string Cancelled = "Cancelled";
     public const string Completed = "Completed";
     public const string Failed = "Failed";
 }
