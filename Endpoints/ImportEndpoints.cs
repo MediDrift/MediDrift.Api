@@ -279,49 +279,134 @@ public static class ImportEndpoints
         AppDbContext db,
         CancellationToken cancellationToken)
     {
-        var exists = await db.ImportJobs.AsNoTracking().AnyAsync(
-            x => x.Id == id && x.WorkspaceId == DefaultWorkspace.Id, cancellationToken);
-        if (!exists) return Results.NotFound(new ApiError("Import was not found."));
+        var job = await db.ImportJobs.AsNoTracking()
+            .Include(x => x.Columns)
+            .FirstOrDefaultAsync(
+                x => x.Id == id && x.WorkspaceId == DefaultWorkspace.Id,
+                cancellationToken);
+
+        if (job is null)
+            return Results.NotFound(new ApiError("Import was not found."));
 
         var entities = await db.MedicationRecords.AsNoTracking()
             .Where(x => x.ImportJobId == id)
             .OrderBy(x => x.SourceRowNumber)
             .ToListAsync(cancellationToken);
+
         var records = entities.Select(ToDto).ToList();
+        var sourceHeaders = job.Columns
+            .OrderBy(x => x.Position)
+            .Select(x => x.SourceName)
+            .ToArray();
 
         var format = request.Query["format"].ToString().ToLowerInvariant();
+
+        // Export every original source column as a separate worksheet.
+        // The normalized worksheet remains available alongside the untouched source data.
         if (format == "xlsx")
         {
             using var workbook = new XLWorkbook();
-            var sheet = workbook.Worksheets.Add("Medication Records");
-            var headers = new[] { "SourceRowNumber", "ExternalId", "MedicationName", "RxCUI", "NDC", "Strength", "DosageForm", "BrandName" };
-            for (var column = 0; column < headers.Length; column++)
-                sheet.Cell(1, column + 1).Value = headers[column];
+
+            var normalizedSheet = workbook.Worksheets.Add("Normalized Records");
+            var normalizedHeaders = new[]
+            {
+                "SourceRowNumber", "ExternalId", "MedicationName", "RxCUI",
+                "NDC", "Strength", "DosageForm", "BrandName"
+            };
+
+            for (var column = 0; column < normalizedHeaders.Length; column++)
+                normalizedSheet.Cell(1, column + 1).Value = normalizedHeaders[column];
 
             for (var index = 0; index < records.Count; index++)
             {
                 var record = records[index];
                 var row = index + 2;
-                sheet.Cell(row, 1).Value = record.SourceRowNumber;
-                sheet.Cell(row, 2).Value = record.ExternalId ?? string.Empty;
-                sheet.Cell(row, 3).Value = record.MedicationName ?? string.Empty;
-                sheet.Cell(row, 4).Value = record.Rxcui ?? string.Empty;
-                sheet.Cell(row, 5).Value = record.Ndc ?? string.Empty;
-                sheet.Cell(row, 6).Value = record.Strength ?? string.Empty;
-                sheet.Cell(row, 7).Value = record.DosageForm ?? string.Empty;
-                sheet.Cell(row, 8).Value = record.BrandName ?? string.Empty;
+                normalizedSheet.Cell(row, 1).Value = record.SourceRowNumber;
+                normalizedSheet.Cell(row, 2).Value = record.ExternalId ?? string.Empty;
+                normalizedSheet.Cell(row, 3).Value = record.MedicationName ?? string.Empty;
+                normalizedSheet.Cell(row, 4).Value = record.Rxcui ?? string.Empty;
+                normalizedSheet.Cell(row, 5).Value = record.Ndc ?? string.Empty;
+                normalizedSheet.Cell(row, 6).Value = record.Strength ?? string.Empty;
+                normalizedSheet.Cell(row, 7).Value = record.DosageForm ?? string.Empty;
+                normalizedSheet.Cell(row, 8).Value = record.BrandName ?? string.Empty;
             }
 
-            sheet.Columns().AdjustToContents();
+            var originalSheet = workbook.Worksheets.Add("Original Source Data");
+            originalSheet.Cell(1, 1).Value = "SourceRowNumber";
+
+            for (var column = 0; column < sourceHeaders.Length; column++)
+                originalSheet.Cell(1, column + 2).Value = sourceHeaders[column];
+
+            for (var index = 0; index < entities.Count; index++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var entity = entities[index];
+                var originalValues = ColumnMappingService.DeserializeRow(entity.OriginalValuesJson);
+                var row = index + 2;
+
+                originalSheet.Cell(row, 1).Value = entity.SourceRowNumber;
+
+                for (var column = 0; column < sourceHeaders.Length; column++)
+                {
+                    originalValues.TryGetValue(sourceHeaders[column], out var value);
+                    originalSheet.Cell(row, column + 2).Value = value ?? string.Empty;
+                }
+            }
+
+            normalizedSheet.SheetView.FreezeRows(1);
+            originalSheet.SheetView.FreezeRows(1);
+            normalizedSheet.Range(1, 1, 1, normalizedHeaders.Length).Style.Font.Bold = true;
+            originalSheet.Range(1, 1, 1, sourceHeaders.Length + 1).Style.Font.Bold = true;
+            normalizedSheet.Columns(1, normalizedHeaders.Length).Width = 20;
+            originalSheet.Columns(1, sourceHeaders.Length + 1).Width = 22;
+
             await using var stream = new MemoryStream();
             workbook.SaveAs(stream);
-            return Results.File(stream.ToArray(),
+
+            return Results.File(
+                stream.ToArray(),
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                $"medidrift-import-{id:N}.xlsx");
+                $"medidrift-import-{id:N}-complete.xlsx");
         }
 
+        // Original-source CSV contains every imported source column, including unmapped fields.
+        if (format == "source-csv")
+        {
+            using var writer = new StringWriter();
+            using (var csv = new CsvWriter(writer, System.Globalization.CultureInfo.InvariantCulture))
+            {
+                csv.WriteField("SourceRowNumber");
+                foreach (var header in sourceHeaders)
+                    csv.WriteField(header);
+                csv.NextRecord();
+
+                foreach (var entity in entities)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var originalValues = ColumnMappingService.DeserializeRow(entity.OriginalValuesJson);
+                    csv.WriteField(entity.SourceRowNumber);
+
+                    foreach (var header in sourceHeaders)
+                    {
+                        originalValues.TryGetValue(header, out var value);
+                        csv.WriteField(CsvSafe(value));
+                    }
+
+                    csv.NextRecord();
+                }
+            }
+
+            return Results.File(
+                Encoding.UTF8.GetPreamble().Concat(Encoding.UTF8.GetBytes(writer.ToString())).ToArray(),
+                "text/csv; charset=utf-8",
+                $"medidrift-import-{id:N}-original-source.csv");
+        }
+
+        // The default CSV export contains the normalized canonical fields.
         if (format is not ("" or "csv"))
-            return Results.BadRequest(new ApiError("Supported export formats are csv and xlsx."));
+            return Results.BadRequest(new ApiError("Supported formats are csv, source-csv and xlsx."));
 
         var csvSafeRecords = records.Select(record => record with
         {
@@ -341,7 +426,8 @@ public static class ImportEndpoints
             csv.Flush();
         }
 
-        return Results.File(Encoding.UTF8.GetPreamble().Concat(Encoding.UTF8.GetBytes(textWriter.ToString())).ToArray(),
+        return Results.File(
+            Encoding.UTF8.GetPreamble().Concat(Encoding.UTF8.GetBytes(textWriter.ToString())).ToArray(),
             "text/csv; charset=utf-8",
             $"medidrift-import-{id:N}.csv");
     }
