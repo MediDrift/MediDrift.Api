@@ -33,6 +33,25 @@ public sealed class MedicationAuditService(
         // Keep completed findings and counters; cached terminology lookups avoid
         // repeating external requests for work that has already finished.
         var isResume = run.StartedUtc is not null;
+        var startedUtc = DateTime.UtcNow;
+
+        // Atomically claim only a queued run. If a user pauses/cancels between
+        // worker selection and execution, the changed state wins and no work starts.
+        var claimed = await db.MedicationAuditRuns
+            .Where(x => x.Id == run.Id && x.Status == MedicationAuditStatuses.Queued)
+            .ExecuteUpdateAsync(update => update
+                .SetProperty(x => x.Status, MedicationAuditStatuses.Running)
+                .SetProperty(x => x.StartedUtc, x => x.StartedUtc ?? startedUtc)
+                .SetProperty(x => x.CompletedUtc, (DateTime?)null)
+                .SetProperty(x => x.ErrorMessage, (string?)null), cancellationToken);
+
+        if (claimed == 0)
+            return;
+
+        await db.Entry(run).ReloadAsync(cancellationToken);
+        if (run.Status is MedicationAuditStatuses.Paused or MedicationAuditStatuses.Cancelled)
+            return;
+
         if (!isResume)
         {
             run.ProcessedIdentifiers = 0;
@@ -48,10 +67,6 @@ public sealed class MedicationAuditService(
             run.LookupErrorCount = 0;
         }
 
-        run.Status = MedicationAuditStatuses.Running;
-        run.StartedUtc ??= DateTime.UtcNow;
-        run.CompletedUtc = null;
-        run.ErrorMessage = null;
         await db.SaveChangesAsync(cancellationToken);
 
         try
