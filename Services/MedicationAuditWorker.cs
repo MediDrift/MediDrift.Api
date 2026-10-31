@@ -10,10 +10,23 @@ public sealed class MedicationAuditWorker(
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        // A process restart should not strand an audit in Running state.
+        // Recover interrupted work without losing the user's last control request.
         await using (var startupScope = scopeFactory.CreateAsyncScope())
         {
             var startupDb = startupScope.ServiceProvider.GetRequiredService<AppDbContext>();
+            var now = DateTime.UtcNow;
+
+            await startupDb.MedicationAuditRuns
+                .Where(x => x.Status == MedicationAuditStatuses.Pausing)
+                .ExecuteUpdateAsync(update => update.SetProperty(x => x.Status, MedicationAuditStatuses.Paused), stoppingToken);
+
+            await startupDb.MedicationAuditRuns
+                .Where(x => x.Status == MedicationAuditStatuses.Cancelling)
+                .ExecuteUpdateAsync(update => update
+                    .SetProperty(x => x.Status, MedicationAuditStatuses.Cancelled)
+                    .SetProperty(x => x.CompletedUtc, now)
+                    .SetProperty(x => x.ErrorMessage, "Cancelled during service restart. Completed findings have been retained."), stoppingToken);
+
             await startupDb.MedicationAuditRuns
                 .Where(x => x.Status == MedicationAuditStatuses.Running)
                 .ExecuteUpdateAsync(update => update.SetProperty(x => x.Status, MedicationAuditStatuses.Queued), stoppingToken);
