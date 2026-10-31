@@ -17,6 +17,9 @@ public static class MedicationAuditEndpoints
 
         var audits = endpoints.MapGroup("/api/audits").WithTags("Medication audits");
         audits.MapGet("/{auditId:guid}", GetAuditAsync).WithSummary("Get audit status and summary");
+        audits.MapPost("/{auditId:guid}/pause", PauseAuditAsync).WithSummary("Pause a running terminology audit");
+        audits.MapPost("/{auditId:guid}/resume", ResumeAuditAsync).WithSummary("Resume a paused terminology audit");
+        audits.MapPost("/{auditId:guid}/cancel", CancelAuditAsync).WithSummary("Cancel a queued or running terminology audit");
         audits.MapGet("/{auditId:guid}/findings", GetFindingsAsync).WithSummary("Get paginated audit findings");
         audits.MapGet("/{auditId:guid}/export", ExportFindingsAsync).WithSummary("Export audit findings as CSV or XLSX");
         return endpoints;
@@ -70,6 +73,64 @@ public static class MedicationAuditEndpoints
         var run = await db.MedicationAuditRuns.AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == auditId && x.WorkspaceId == DefaultWorkspace.Id, cancellationToken);
         return run is null ? Results.NotFound(new ApiError("Audit was not found.")) : Results.Ok(ToDto(run));
+    }
+
+    private static async Task<IResult> PauseAuditAsync(
+        Guid auditId,
+        AppDbContext db,
+        CancellationToken cancellationToken)
+    {
+        var run = await db.MedicationAuditRuns.FirstOrDefaultAsync(
+            x => x.Id == auditId && x.WorkspaceId == DefaultWorkspace.Id,
+            cancellationToken);
+
+        if (run is null) return Results.NotFound(new ApiError("Audit was not found."));
+        if (run.Status is not (MedicationAuditStatuses.Queued or MedicationAuditStatuses.Running))
+            return Results.Conflict(new ApiError("Only a queued or running audit can be paused."));
+
+        run.Status = MedicationAuditStatuses.Paused;
+        await db.SaveChangesAsync(cancellationToken);
+        return Results.Ok(ToDto(run));
+    }
+
+    private static async Task<IResult> ResumeAuditAsync(
+        Guid auditId,
+        AppDbContext db,
+        CancellationToken cancellationToken)
+    {
+        var run = await db.MedicationAuditRuns.FirstOrDefaultAsync(
+            x => x.Id == auditId && x.WorkspaceId == DefaultWorkspace.Id,
+            cancellationToken);
+
+        if (run is null) return Results.NotFound(new ApiError("Audit was not found."));
+        if (run.Status != MedicationAuditStatuses.Paused)
+            return Results.Conflict(new ApiError("Only a paused audit can be resumed."));
+
+        // The worker reuses persisted findings and terminology cache entries.
+        run.Status = MedicationAuditStatuses.Queued;
+        run.ErrorMessage = null;
+        await db.SaveChangesAsync(cancellationToken);
+        return Results.Ok(ToDto(run));
+    }
+
+    private static async Task<IResult> CancelAuditAsync(
+        Guid auditId,
+        AppDbContext db,
+        CancellationToken cancellationToken)
+    {
+        var run = await db.MedicationAuditRuns.FirstOrDefaultAsync(
+            x => x.Id == auditId && x.WorkspaceId == DefaultWorkspace.Id,
+            cancellationToken);
+
+        if (run is null) return Results.NotFound(new ApiError("Audit was not found."));
+        if (run.Status is not (MedicationAuditStatuses.Queued or MedicationAuditStatuses.Running or MedicationAuditStatuses.Paused))
+            return Results.Conflict(new ApiError("This audit can no longer be cancelled."));
+
+        run.Status = MedicationAuditStatuses.Cancelled;
+        run.CompletedUtc = DateTime.UtcNow;
+        run.ErrorMessage = "Cancelled by the user. Partial findings have been retained.";
+        await db.SaveChangesAsync(cancellationToken);
+        return Results.Ok(ToDto(run));
     }
 
     private static async Task<IResult> GetFindingsAsync(
