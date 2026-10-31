@@ -17,7 +17,8 @@ public sealed class MedicationAuditService(
 {
     private static readonly TimeSpan CacheLifetime = TimeSpan.FromHours(24);
     private static readonly TimeSpan RequestSpacing = TimeSpan.FromMilliseconds(250);
-    private const int MaxUniqueIdentifiersPerAudit = 1000;
+    private const int ProgressSaveBatchSize = 50;
+    private const int FindingsSaveBatchSize = 500;
 
     public async Task ProcessRunAsync(Guid auditRunId, CancellationToken cancellationToken)
     {
@@ -26,8 +27,14 @@ public sealed class MedicationAuditService(
         if (run is null || run.Status is MedicationAuditStatuses.Completed or MedicationAuditStatuses.Failed)
             return;
 
+        // A restarted worker may re-enter this run. Remove any partially written
+        // findings first; terminology cache entries remain reusable across retries.
+        await db.MedicationAuditFindings
+            .Where(x => x.AuditRunId == run.Id)
+            .ExecuteDeleteAsync(cancellationToken);
+
         run.Status = MedicationAuditStatuses.Running;
-        run.StartedUtc = DateTime.UtcNow;
+        run.StartedUtc ??= DateTime.UtcNow;
         run.ErrorMessage = null;
         await db.SaveChangesAsync(cancellationToken);
 
@@ -70,10 +77,6 @@ public sealed class MedicationAuditService(
                 }
             }
 
-            if (distinctChecks.Count > MaxUniqueIdentifiersPerAudit)
-                throw new InvalidOperationException(
-                    $"This MVP supports up to {MaxUniqueIdentifiersPerAudit} distinct identifiers per audit. Split the catalogue into smaller imports.");
-
             run.TotalRecords = records.Count;
             var missingIdentifierRows = rowChecks.Count(x => x.Type == "None");
             run.TotalIdentifiers = distinctChecks.Count + missingIdentifierRows;
@@ -94,7 +97,15 @@ public sealed class MedicationAuditService(
             run.MissingIdentifierCount = findings.Count(x => x.Status == FindingStatuses.MissingIdentifier);
             run.LookupErrorCount = findings.Count(x => x.Status == FindingStatuses.LookupError);
 
-            db.MedicationAuditFindings.AddRange(findings);
+            // Persist findings in bounded batches so large catalogues do not create
+            // one oversized EF change set. If interrupted, the next worker attempt
+            // clears partial findings and reuses the persisted terminology cache.
+            foreach (var batch in findings.Chunk(FindingsSaveBatchSize))
+            {
+                db.MedicationAuditFindings.AddRange(batch);
+                await db.SaveChangesAsync(cancellationToken);
+            }
+
             run.Status = MedicationAuditStatuses.Completed;
             run.CompletedUtc = DateTime.UtcNow;
             await db.SaveChangesAsync(cancellationToken);
@@ -122,6 +133,17 @@ public sealed class MedicationAuditService(
         var results = new Dictionary<string, RxNormLookupResult>(StringComparer.Ordinal);
         if (checks.Count == 0) return results;
 
+        var pendingProgressWrites = 0;
+
+        async Task FlushProgressAsync(bool force = false)
+        {
+            if (force || pendingProgressWrites >= ProgressSaveBatchSize)
+            {
+                await db.SaveChangesAsync(cancellationToken);
+                pendingProgressWrites = 0;
+            }
+        }
+
         var typesAndIds = checks.Values
             .Select(x => (x.Type, x.NormalizedIdentifier))
             .Distinct()
@@ -141,7 +163,8 @@ public sealed class MedicationAuditService(
             {
                 results[key] = RxNormResponseParser.InvalidFormat(check.Type, check.SubmittedIdentifier, check.InvalidFormatMessage);
                 run.ProcessedIdentifiers++;
-                await db.SaveChangesAsync(cancellationToken);
+                pendingProgressWrites++;
+                await FlushProgressAsync();
                 continue;
             }
 
@@ -156,7 +179,8 @@ public sealed class MedicationAuditService(
                         ? RxNormResponseParser.ParseRxcui(cached.RawResponseJson, true)
                         : RxNormResponseParser.ParseNdc(cached.RawResponseJson, true);
                     run.ProcessedIdentifiers++;
-                    await db.SaveChangesAsync(cancellationToken);
+                    pendingProgressWrites++;
+                    await FlushProgressAsync();
                     continue;
                 }
                 catch (JsonException exception)
@@ -190,9 +214,13 @@ public sealed class MedicationAuditService(
             }
 
             run.ProcessedIdentifiers++;
-            await db.SaveChangesAsync(cancellationToken);
+            pendingProgressWrites++;
+            await FlushProgressAsync();
             await Task.Delay(RequestSpacing, cancellationToken);
         }
+
+        // Persist the final partial batch, including the last cache entry and progress.
+        await FlushProgressAsync(force: true);
 
         return results;
     }
@@ -304,7 +332,7 @@ public sealed class MedicationAuditService(
         if (type == "RxCUI" && !IsDigits(normalized))
             invalidMessage = "RxCUI values must contain digits only. This value was not sent to RxNorm.";
         else if (type == "NDC" && !IsValidNdc(normalized))
-            invalidMessage = "NDC must be 11 digits or use a supported segmented format: 5-3-2, 5-4-1 or 4-4-2. Ten unformatted digits are ambiguous and are not padded automatically.";
+            invalidMessage = "NDC must be 11 digits or use a supported segmented format: 5-3-2, 5-4-1, 4-4-2 or 5-4-2. Ten unformatted digits are ambiguous and are not padded automatically.";
 
         // Retain distinct original invalid values so they do not collide after normalization.
         var keyIdentifier = invalidMessage is null ? normalized : submittedIdentifier.Trim().ToUpperInvariant();
@@ -326,7 +354,8 @@ public sealed class MedicationAuditService(
         return parts.Length == 3 &&
             (parts[0].Length == 5 && parts[1].Length == 3 && parts[2].Length == 2
              || parts[0].Length == 5 && parts[1].Length == 4 && parts[2].Length == 1
-             || parts[0].Length == 4 && parts[1].Length == 4 && parts[2].Length == 2);
+             || parts[0].Length == 4 && parts[1].Length == 4 && parts[2].Length == 2
+             || parts[0].Length == 5 && parts[1].Length == 4 && parts[2].Length == 2);
     }
 
     private static string MakeKey(string type, string normalized) => $"{type.ToUpperInvariant()}:{normalized}";
