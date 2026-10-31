@@ -17,7 +17,7 @@ public sealed class MedicationAuditService(
 {
     private static readonly TimeSpan CacheLifetime = TimeSpan.FromHours(24);
     private static readonly TimeSpan RequestSpacing = TimeSpan.FromMilliseconds(250);
-    private const int ProgressSaveBatchSize = 50;
+    private const int ProgressSaveBatchSize = 10;
     private const int FindingsSaveBatchSize = 500;
 
     public async Task ProcessRunAsync(Guid auditRunId, CancellationToken cancellationToken)
@@ -34,7 +34,19 @@ public sealed class MedicationAuditService(
             .ExecuteDeleteAsync(cancellationToken);
 
         run.Status = MedicationAuditStatuses.Running;
-        run.StartedUtc ??= DateTime.UtcNow;
+        run.StartedUtc = DateTime.UtcNow;
+        run.CompletedUtc = null;
+        run.ProcessedIdentifiers = 0;
+        run.ActiveCount = 0;
+        run.ObsoleteCount = 0;
+        run.RemappedCount = 0;
+        run.QuantifiedCount = 0;
+        run.NotCurrentCount = 0;
+        run.UnknownCount = 0;
+        run.AlienCount = 0;
+        run.InvalidFormatCount = 0;
+        run.MissingIdentifierCount = 0;
+        run.LookupErrorCount = 0;
         run.ErrorMessage = null;
         await db.SaveChangesAsync(cancellationToken);
 
