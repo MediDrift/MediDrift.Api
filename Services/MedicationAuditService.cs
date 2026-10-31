@@ -332,7 +332,7 @@ public sealed class MedicationAuditService(
         if (type == "RxCUI" && !IsDigits(normalized))
             invalidMessage = "RxCUI values must contain digits only. This value was not sent to RxNorm.";
         else if (type == "NDC" && !IsValidNdc(normalized))
-            invalidMessage = "NDC must be 11 digits or use a supported segmented format: 5-3-2, 5-4-1 or 4-4-2. Ten unformatted digits are ambiguous and are not padded automatically.";
+            invalidMessage = "NDC must be 11 digits or use a supported segmented format: 5-3-2, 5-4-1, 4-4-2 or 5-4-2. Ten unformatted digits are ambiguous and are not padded automatically.";
 
         // Retain distinct original invalid values so they do not collide after normalization.
         var keyIdentifier = invalidMessage is null ? normalized : submittedIdentifier.Trim().ToUpperInvariant();
@@ -354,7 +354,8 @@ public sealed class MedicationAuditService(
         return parts.Length == 3 &&
             (parts[0].Length == 5 && parts[1].Length == 3 && parts[2].Length == 2
              || parts[0].Length == 5 && parts[1].Length == 4 && parts[2].Length == 1
-             || parts[0].Length == 4 && parts[1].Length == 4 && parts[2].Length == 2);
+             || parts[0].Length == 4 && parts[1].Length == 4 && parts[2].Length == 2
+             || parts[0].Length == 5 && parts[1].Length == 4 && parts[2].Length == 2);
     }
 
     private static string MakeKey(string type, string normalized) => $"{type.ToUpperInvariant()}:{normalized}";
