@@ -79,7 +79,8 @@ public static class MedicationAuditEndpoints
         string? status,
         string? identifierType,
         AppDbContext db,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool latest = false)
     {
         var exists = await db.MedicationAuditRuns.AsNoTracking().AnyAsync(
             x => x.Id == auditId && x.WorkspaceId == DefaultWorkspace.Id, cancellationToken);
@@ -92,10 +93,15 @@ public static class MedicationAuditEndpoints
         if (!string.IsNullOrWhiteSpace(identifierType)) query = query.Where(x => x.IdentifierType == identifierType);
 
         var total = await query.CountAsync(cancellationToken);
-        var findings = await query.OrderBy(x => x.SourceRowNumber).ThenBy(x => x.IdentifierType)
-            .Skip((page - 1) * pageSize)
-            .Take(pageSize)
-            .ToListAsync(cancellationToken);
+        var findings = latest
+            ? await query.OrderByDescending(x => x.CheckedUtc).ThenByDescending(x => x.Id)
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .ToListAsync(cancellationToken)
+            : await query.OrderBy(x => x.SourceRowNumber).ThenBy(x => x.IdentifierType)
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .ToListAsync(cancellationToken);
 
         return Results.Ok(new PagedResult<MedicationAuditFindingDto>(findings.Select(ToDto).ToArray(), page, pageSize, total));
     }
