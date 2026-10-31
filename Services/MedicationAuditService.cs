@@ -140,11 +140,39 @@ public sealed class MedicationAuditService(
             // Complete only when the persisted state is still Running. A concurrent
             // pause or cancel request wins over completion.
             var completedUtc = DateTime.UtcNow;
-            await db.MedicationAuditRuns
+            var completedRows = await db.MedicationAuditRuns
                 .Where(x => x.Id == run.Id && x.Status == MedicationAuditStatuses.Running)
                 .ExecuteUpdateAsync(update => update
                     .SetProperty(x => x.Status, MedicationAuditStatuses.Completed)
                     .SetProperty(x => x.CompletedUtc, completedUtc), cancellationToken);
+
+            // If a control request arrived after the last progress checkpoint, finish
+            // that transition here rather than leaving the run stuck in Pausing/Cancelling.
+            if (completedRows == 0)
+            {
+                var currentStatus = await db.MedicationAuditRuns.AsNoTracking()
+                    .Where(x => x.Id == run.Id)
+                    .Select(x => x.Status)
+                    .FirstOrDefaultAsync(cancellationToken);
+
+                if (currentStatus == MedicationAuditStatuses.Pausing)
+                {
+                    await db.MedicationAuditRuns
+                        .Where(x => x.Id == run.Id && x.Status == MedicationAuditStatuses.Pausing)
+                        .ExecuteUpdateAsync(update => update
+                            .SetProperty(x => x.Status, MedicationAuditStatuses.Paused), cancellationToken);
+                }
+                else if (currentStatus == MedicationAuditStatuses.Cancelling)
+                {
+                    var cancelledUtc = DateTime.UtcNow;
+                    await db.MedicationAuditRuns
+                        .Where(x => x.Id == run.Id && x.Status == MedicationAuditStatuses.Cancelling)
+                        .ExecuteUpdateAsync(update => update
+                            .SetProperty(x => x.Status, MedicationAuditStatuses.Cancelled)
+                            .SetProperty(x => x.CompletedUtc, cancelledUtc)
+                            .SetProperty(x => x.ErrorMessage, "Cancelled by the user. Partial findings have been retained."), cancellationToken);
+                }
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
