@@ -95,8 +95,10 @@ public sealed class MedicationAuditService(
             run.ProcessedIdentifiers = missingIdentifierRows;
             await db.SaveChangesAsync(cancellationToken);
 
-            var lookupResults = await ResolveIdentifiersAsync(run, distinctChecks, cancellationToken);
-            var findings = rowChecks.Select(check => CreateFinding(run.Id, check, lookupResults)).ToList();
+            await ResolveIdentifiersAsync(run, distinctChecks, rowChecks, cancellationToken);
+            var findings = await db.MedicationAuditFindings.AsNoTracking()
+                .Where(x => x.AuditRunId == run.Id)
+                .ToListAsync(cancellationToken);
 
             run.ActiveCount = findings.Count(x => x.Status == FindingStatuses.Active);
             run.ObsoleteCount = findings.Count(x => x.Status == FindingStatuses.Obsolete);
@@ -108,15 +110,6 @@ public sealed class MedicationAuditService(
             run.InvalidFormatCount = findings.Count(x => x.Status == FindingStatuses.InvalidFormat);
             run.MissingIdentifierCount = findings.Count(x => x.Status == FindingStatuses.MissingIdentifier);
             run.LookupErrorCount = findings.Count(x => x.Status == FindingStatuses.LookupError);
-
-            // Persist findings in bounded batches so large catalogues do not create
-            // one oversized EF change set. If interrupted, the next worker attempt
-            // clears partial findings and reuses the persisted terminology cache.
-            foreach (var batch in findings.Chunk(FindingsSaveBatchSize))
-            {
-                db.MedicationAuditFindings.AddRange(batch);
-                await db.SaveChangesAsync(cancellationToken);
-            }
 
             run.Status = MedicationAuditStatuses.Completed;
             run.CompletedUtc = DateTime.UtcNow;
@@ -140,20 +133,71 @@ public sealed class MedicationAuditService(
     private async Task<Dictionary<string, RxNormLookupResult>> ResolveIdentifiersAsync(
         MedicationAuditRun run,
         IReadOnlyDictionary<string, IdentifierCheck> checks,
+        IReadOnlyList<RowIdentifierCheck> rowChecks,
         CancellationToken cancellationToken)
     {
         var results = new Dictionary<string, RxNormLookupResult>(StringComparer.Ordinal);
-        if (checks.Count == 0) return results;
-
+        var rowsByIdentifier = rowChecks
+            .Where(x => x.Type != "None")
+            .GroupBy(x => MakeKey(x.Type, x.NormalizedIdentifier))
+            .ToDictionary(x => x.Key, x => x.ToList(), StringComparer.Ordinal);
+        var resolvedKeys = new List<string>();
+        var persistedFindingKeys = new HashSet<string>(StringComparer.Ordinal);
+        var nextResolvedKey = 0;
         var pendingProgressWrites = 0;
+
+        async Task PersistAvailableFindingsAsync()
+        {
+            var pendingFindings = new List<MedicationAuditFinding>();
+
+            // Missing identifiers can be reported immediately without an RxNorm request.
+            if (persistedFindingKeys.Add("missing"))
+            {
+                pendingFindings.AddRange(rowChecks
+                    .Where(x => x.Type == "None")
+                    .Select(x => CreateFinding(run.Id, x, results)));
+            }
+
+            // Persist the findings for each newly resolved unique identifier. Rows
+            // sharing an identifier all receive a finding, while only one RxNorm
+            // request is made for that identifier.
+            while (nextResolvedKey < resolvedKeys.Count)
+            {
+                var key = resolvedKeys[nextResolvedKey++];
+                if (!rowsByIdentifier.TryGetValue(key, out var matchingRows))
+                    continue;
+
+                foreach (var rowCheck in matchingRows)
+                {
+                    var findingKey = $"{rowCheck.Record.Id}:{rowCheck.Type}";
+                    if (persistedFindingKeys.Add(findingKey))
+                        pendingFindings.Add(CreateFinding(run.Id, rowCheck, results));
+                }
+            }
+
+            foreach (var batch in pendingFindings.Chunk(FindingsSaveBatchSize))
+            {
+                db.MedicationAuditFindings.AddRange(batch);
+                await db.SaveChangesAsync(cancellationToken);
+            }
+        }
 
         async Task FlushProgressAsync(bool force = false)
         {
             if (force || pendingProgressWrites >= ProgressSaveBatchSize)
             {
+                // Findings and progress become visible to polling clients together.
+                await PersistAvailableFindingsAsync();
                 await db.SaveChangesAsync(cancellationToken);
                 pendingProgressWrites = 0;
             }
+        }
+
+        if (checks.Count == 0)
+        {
+            await PersistAvailableFindingsAsync();
+            await db.SaveChangesAsync(cancellationToken);
+            return results;
         }
 
         var typesAndIds = checks.Values
@@ -174,6 +218,7 @@ public sealed class MedicationAuditService(
             if (check.InvalidFormatMessage is not null)
             {
                 results[key] = RxNormResponseParser.InvalidFormat(check.Type, check.SubmittedIdentifier, check.InvalidFormatMessage);
+                resolvedKeys.Add(key);
                 run.ProcessedIdentifiers++;
                 pendingProgressWrites++;
                 await FlushProgressAsync();
@@ -190,6 +235,7 @@ public sealed class MedicationAuditService(
                     results[key] = check.Type == "RxCUI"
                         ? RxNormResponseParser.ParseRxcui(cached.RawResponseJson, true)
                         : RxNormResponseParser.ParseNdc(cached.RawResponseJson, true);
+                    resolvedKeys.Add(key);
                     run.ProcessedIdentifiers++;
                     pendingProgressWrites++;
                     await FlushProgressAsync();
@@ -225,6 +271,7 @@ public sealed class MedicationAuditService(
                 results[key] = RxNormResponseParser.ServiceError(check.Type, safeDetail);
             }
 
+            resolvedKeys.Add(key);
             run.ProcessedIdentifiers++;
             pendingProgressWrites++;
             await FlushProgressAsync();
@@ -232,6 +279,7 @@ public sealed class MedicationAuditService(
         }
 
         // Persist the final partial batch, including the last cache entry and progress.
+        await PersistAvailableFindingsAsync();
         await FlushProgressAsync(force: true);
 
         return results;
