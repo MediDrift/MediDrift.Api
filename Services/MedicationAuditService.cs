@@ -17,7 +17,7 @@ public sealed class MedicationAuditService(
 {
     private static readonly TimeSpan CacheLifetime = TimeSpan.FromHours(24);
     private static readonly TimeSpan RequestSpacing = TimeSpan.FromMilliseconds(250);
-    private const int ProgressSaveBatchSize = 10;
+    private const int ProgressSaveBatchSize = 5;
     private const int FindingsSaveBatchSize = 500;
 
     public async Task ProcessRunAsync(Guid auditRunId, CancellationToken cancellationToken)
@@ -25,7 +25,8 @@ public sealed class MedicationAuditService(
         var run = await db.MedicationAuditRuns
             .FirstOrDefaultAsync(x => x.Id == auditRunId, cancellationToken);
         if (run is null || run.Status is MedicationAuditStatuses.Completed
-            or MedicationAuditStatuses.Failed or MedicationAuditStatuses.Paused
+            or MedicationAuditStatuses.Failed or MedicationAuditStatuses.Pausing
+            or MedicationAuditStatuses.Paused or MedicationAuditStatuses.Cancelling
             or MedicationAuditStatuses.Cancelled)
             return;
 
@@ -157,6 +158,26 @@ public sealed class MedicationAuditService(
                 .Select(x => x.Status)
                 .FirstOrDefaultAsync(CancellationToken.None);
 
+            if (currentStatus == MedicationAuditStatuses.Pausing)
+            {
+                await db.MedicationAuditRuns
+                    .Where(x => x.Id == run.Id && x.Status == MedicationAuditStatuses.Pausing)
+                    .ExecuteUpdateAsync(update => update.SetProperty(x => x.Status, MedicationAuditStatuses.Paused), CancellationToken.None);
+                return;
+            }
+
+            if (currentStatus == MedicationAuditStatuses.Cancelling)
+            {
+                var cancelledUtc = DateTime.UtcNow;
+                await db.MedicationAuditRuns
+                    .Where(x => x.Id == run.Id && x.Status == MedicationAuditStatuses.Cancelling)
+                    .ExecuteUpdateAsync(update => update
+                        .SetProperty(x => x.Status, MedicationAuditStatuses.Cancelled)
+                        .SetProperty(x => x.CompletedUtc, cancelledUtc)
+                        .SetProperty(x => x.ErrorMessage, "Cancelled by the user. Partial findings have been retained."), CancellationToken.None);
+                return;
+            }
+
             if (currentStatus is MedicationAuditStatuses.Paused or MedicationAuditStatuses.Cancelled)
                 return;
 
@@ -230,32 +251,55 @@ public sealed class MedicationAuditService(
             }
         }
 
-        async Task<bool> FlushProgressAsync(bool force = false)
+        async Task<bool> ContinueOrFinalizeControlRequestAsync()
         {
-            if (!force && pendingProgressWrites < ProgressSaveBatchSize)
-                return true;
-
-            await PersistAvailableFindingsAsync();
-            await db.SaveChangesAsync(cancellationToken);
-            pendingProgressWrites = 0;
-
             var currentStatus = await db.MedicationAuditRuns.AsNoTracking()
                 .Where(x => x.Id == run.Id)
                 .Select(x => x.Status)
                 .FirstOrDefaultAsync(cancellationToken);
 
+            if (currentStatus == MedicationAuditStatuses.Pausing)
+            {
+                await db.MedicationAuditRuns
+                    .Where(x => x.Id == run.Id && x.Status == MedicationAuditStatuses.Pausing)
+                    .ExecuteUpdateAsync(update => update
+                        .SetProperty(x => x.Status, MedicationAuditStatuses.Paused), cancellationToken);
+                return false;
+            }
+
+            if (currentStatus == MedicationAuditStatuses.Cancelling)
+            {
+                var cancelledUtc = DateTime.UtcNow;
+                await db.MedicationAuditRuns
+                    .Where(x => x.Id == run.Id && x.Status == MedicationAuditStatuses.Cancelling)
+                    .ExecuteUpdateAsync(update => update
+                        .SetProperty(x => x.Status, MedicationAuditStatuses.Cancelled)
+                        .SetProperty(x => x.CompletedUtc, cancelledUtc)
+                        .SetProperty(x => x.ErrorMessage, "Cancelled by the user. Partial findings have been retained."), cancellationToken);
+                return false;
+            }
+
             return currentStatus is not (MedicationAuditStatuses.Paused or MedicationAuditStatuses.Cancelled);
+        }
+
+        async Task<bool> FlushProgressAsync(bool force = false)
+        {
+            if (!force && pendingProgressWrites < ProgressSaveBatchSize)
+                return true;
+
+            // Save the final in-flight batch before honouring a pause/cancel request.
+            await PersistAvailableFindingsAsync();
+            await db.SaveChangesAsync(cancellationToken);
+            pendingProgressWrites = 0;
+
+            return await ContinueOrFinalizeControlRequestAsync();
         }
 
         if (checks.Count == 0)
         {
             await PersistAvailableFindingsAsync();
             await db.SaveChangesAsync(cancellationToken);
-            var emptyRunStatus = await db.MedicationAuditRuns.AsNoTracking()
-                .Where(x => x.Id == run.Id)
-                .Select(x => x.Status)
-                .FirstOrDefaultAsync(cancellationToken);
-            return emptyRunStatus is not (MedicationAuditStatuses.Paused or MedicationAuditStatuses.Cancelled);
+            return await ContinueOrFinalizeControlRequestAsync();
         }
 
         var checksToResolve = checks
@@ -267,11 +311,7 @@ public sealed class MedicationAuditService(
         {
             await PersistAvailableFindingsAsync();
             await db.SaveChangesAsync(cancellationToken);
-            var finishedStatus = await db.MedicationAuditRuns.AsNoTracking()
-                .Where(x => x.Id == run.Id)
-                .Select(x => x.Status)
-                .FirstOrDefaultAsync(cancellationToken);
-            return finishedStatus is not (MedicationAuditStatuses.Paused or MedicationAuditStatuses.Cancelled);
+            return await ContinueOrFinalizeControlRequestAsync();
         }
 
         var typesAndIds = checksToResolve
