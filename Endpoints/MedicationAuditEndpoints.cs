@@ -85,10 +85,23 @@ public static class MedicationAuditEndpoints
             cancellationToken);
 
         if (run is null) return Results.NotFound(new ApiError("Audit was not found."));
-        if (run.Status is not (MedicationAuditStatuses.Queued or MedicationAuditStatuses.Running))
+        if (run.Status == MedicationAuditStatuses.Queued)
+        {
+            // If the worker has not claimed it yet, pausing is immediate. The worker
+            // uses a conditional Queued -> Running update and cannot overwrite this.
+            run.Status = MedicationAuditStatuses.Paused;
+        }
+        else if (run.Status == MedicationAuditStatuses.Running)
+        {
+            // Let the active worker finish its current bounded checkpoint, persist it,
+            // then transition to Paused. The UI continues polling until it is safe.
+            run.Status = MedicationAuditStatuses.Pausing;
+        }
+        else
+        {
             return Results.Conflict(new ApiError("Only a queued or running audit can be paused."));
+        }
 
-        run.Status = MedicationAuditStatuses.Paused;
         await db.SaveChangesAsync(cancellationToken);
         return Results.Ok(ToDto(run));
     }
@@ -123,12 +136,24 @@ public static class MedicationAuditEndpoints
             cancellationToken);
 
         if (run is null) return Results.NotFound(new ApiError("Audit was not found."));
-        if (run.Status is not (MedicationAuditStatuses.Queued or MedicationAuditStatuses.Running or MedicationAuditStatuses.Paused))
-            return Results.Conflict(new ApiError("This audit can no longer be cancelled."));
 
-        run.Status = MedicationAuditStatuses.Cancelled;
-        run.CompletedUtc = DateTime.UtcNow;
-        run.ErrorMessage = "Cancelled by the user. Partial findings have been retained.";
+        if (run.Status is MedicationAuditStatuses.Running or MedicationAuditStatuses.Pausing)
+        {
+            // The active worker saves the last in-flight batch before becoming Cancelled.
+            run.Status = MedicationAuditStatuses.Cancelling;
+            run.ErrorMessage = "Cancellation requested. Saving completed findings…";
+        }
+        else if (run.Status is MedicationAuditStatuses.Queued or MedicationAuditStatuses.Paused)
+        {
+            run.Status = MedicationAuditStatuses.Cancelled;
+            run.CompletedUtc = DateTime.UtcNow;
+            run.ErrorMessage = "Cancelled by the user. Partial findings have been retained.";
+        }
+        else if (run.Status != MedicationAuditStatuses.Cancelling)
+        {
+            return Results.Conflict(new ApiError("This audit can no longer be cancelled."));
+        }
+
         await db.SaveChangesAsync(cancellationToken);
         return Results.Ok(ToDto(run));
     }
