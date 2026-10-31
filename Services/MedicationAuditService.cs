@@ -24,29 +24,33 @@ public sealed class MedicationAuditService(
     {
         var run = await db.MedicationAuditRuns
             .FirstOrDefaultAsync(x => x.Id == auditRunId, cancellationToken);
-        if (run is null || run.Status is MedicationAuditStatuses.Completed or MedicationAuditStatuses.Failed)
+        if (run is null || run.Status is MedicationAuditStatuses.Completed
+            or MedicationAuditStatuses.Failed or MedicationAuditStatuses.Paused
+            or MedicationAuditStatuses.Cancelled)
             return;
 
-        // A restarted worker may re-enter this run. Remove any partially written
-        // findings first; terminology cache entries remain reusable across retries.
-        await db.MedicationAuditFindings
-            .Where(x => x.AuditRunId == run.Id)
-            .ExecuteDeleteAsync(cancellationToken);
+        // A previously started run is being resumed after a pause or process restart.
+        // Keep completed findings and counters; cached terminology lookups avoid
+        // repeating external requests for work that has already finished.
+        var isResume = run.StartedUtc is not null;
+        if (!isResume)
+        {
+            run.ProcessedIdentifiers = 0;
+            run.ActiveCount = 0;
+            run.ObsoleteCount = 0;
+            run.RemappedCount = 0;
+            run.QuantifiedCount = 0;
+            run.NotCurrentCount = 0;
+            run.UnknownCount = 0;
+            run.AlienCount = 0;
+            run.InvalidFormatCount = 0;
+            run.MissingIdentifierCount = 0;
+            run.LookupErrorCount = 0;
+        }
 
         run.Status = MedicationAuditStatuses.Running;
-        run.StartedUtc = DateTime.UtcNow;
+        run.StartedUtc ??= DateTime.UtcNow;
         run.CompletedUtc = null;
-        run.ProcessedIdentifiers = 0;
-        run.ActiveCount = 0;
-        run.ObsoleteCount = 0;
-        run.RemappedCount = 0;
-        run.QuantifiedCount = 0;
-        run.NotCurrentCount = 0;
-        run.UnknownCount = 0;
-        run.AlienCount = 0;
-        run.InvalidFormatCount = 0;
-        run.MissingIdentifierCount = 0;
-        run.LookupErrorCount = 0;
         run.ErrorMessage = null;
         await db.SaveChangesAsync(cancellationToken);
 
@@ -92,10 +96,14 @@ public sealed class MedicationAuditService(
             run.TotalRecords = records.Count;
             var missingIdentifierRows = rowChecks.Count(x => x.Type == "None");
             run.TotalIdentifiers = distinctChecks.Count + missingIdentifierRows;
-            run.ProcessedIdentifiers = missingIdentifierRows;
+            if (!isResume)
+                run.ProcessedIdentifiers = missingIdentifierRows;
             await db.SaveChangesAsync(cancellationToken);
 
-            await ResolveIdentifiersAsync(run, distinctChecks, rowChecks, cancellationToken);
+            var canContinue = await ResolveIdentifiersAsync(run, distinctChecks, rowChecks, cancellationToken);
+            if (!canContinue)
+                return;
+
             var findings = await db.MedicationAuditFindings.AsNoTracking()
                 .Where(x => x.AuditRunId == run.Id)
                 .ToListAsync(cancellationToken);
@@ -111,9 +119,16 @@ public sealed class MedicationAuditService(
             run.MissingIdentifierCount = findings.Count(x => x.Status == FindingStatuses.MissingIdentifier);
             run.LookupErrorCount = findings.Count(x => x.Status == FindingStatuses.LookupError);
 
-            run.Status = MedicationAuditStatuses.Completed;
-            run.CompletedUtc = DateTime.UtcNow;
             await db.SaveChangesAsync(cancellationToken);
+
+            // Complete only when the persisted state is still Running. A concurrent
+            // pause or cancel request wins over completion.
+            var completedUtc = DateTime.UtcNow;
+            await db.MedicationAuditRuns
+                .Where(x => x.Id == run.Id && x.Status == MedicationAuditStatuses.Running)
+                .ExecuteUpdateAsync(update => update
+                    .SetProperty(x => x.Status, MedicationAuditStatuses.Completed)
+                    .SetProperty(x => x.CompletedUtc, completedUtc), cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -122,15 +137,27 @@ public sealed class MedicationAuditService(
         }
         catch (Exception exception)
         {
-            run.Status = MedicationAuditStatuses.Failed;
-            run.ErrorMessage = exception.Message.Length > 1000 ? exception.Message[..1000] : exception.Message;
-            run.CompletedUtc = DateTime.UtcNow;
-            await db.SaveChangesAsync(CancellationToken.None);
+            var currentStatus = await db.MedicationAuditRuns.AsNoTracking()
+                .Where(x => x.Id == run.Id)
+                .Select(x => x.Status)
+                .FirstOrDefaultAsync(CancellationToken.None);
+
+            if (currentStatus is MedicationAuditStatuses.Paused or MedicationAuditStatuses.Cancelled)
+                return;
+
+            var failedUtc = DateTime.UtcNow;
+            var safeMessage = exception.Message.Length > 1000 ? exception.Message[..1000] : exception.Message;
+            await db.MedicationAuditRuns
+                .Where(x => x.Id == run.Id && x.Status == MedicationAuditStatuses.Running)
+                .ExecuteUpdateAsync(update => update
+                    .SetProperty(x => x.Status, MedicationAuditStatuses.Failed)
+                    .SetProperty(x => x.ErrorMessage, safeMessage)
+                    .SetProperty(x => x.CompletedUtc, failedUtc), CancellationToken.None);
             logger.LogError(exception, "Medication audit {AuditRunId} failed.", auditRunId);
         }
     }
 
-    private async Task<Dictionary<string, RxNormLookupResult>> ResolveIdentifiersAsync(
+    private async Task<bool> ResolveIdentifiersAsync(
         MedicationAuditRun run,
         IReadOnlyDictionary<string, IdentifierCheck> checks,
         IReadOnlyList<RowIdentifierCheck> rowChecks,
@@ -141,8 +168,14 @@ public sealed class MedicationAuditService(
             .Where(x => x.Type != "None")
             .GroupBy(x => MakeKey(x.Type, x.NormalizedIdentifier))
             .ToDictionary(x => x.Key, x => x.ToList(), StringComparer.Ordinal);
+        var existingFindingKeys = await db.MedicationAuditFindings.AsNoTracking()
+            .Where(x => x.AuditRunId == run.Id)
+            .Select(x => new { x.MedicationRecordId, x.IdentifierType })
+            .ToListAsync(cancellationToken);
+        var persistedFindingKeys = existingFindingKeys
+            .Select(x => $"{x.MedicationRecordId}:{x.IdentifierType}")
+            .ToHashSet(StringComparer.Ordinal);
         var resolvedKeys = new List<string>();
-        var persistedFindingKeys = new HashSet<string>(StringComparer.Ordinal);
         var nextResolvedKey = 0;
         var pendingProgressWrites = 0;
 
@@ -150,12 +183,12 @@ public sealed class MedicationAuditService(
         {
             var pendingFindings = new List<MedicationAuditFinding>();
 
-            // Missing identifiers can be reported immediately without an RxNorm request.
-            if (persistedFindingKeys.Add("missing"))
+            // Missing identifier findings are saved once and retained across resumes.
+            foreach (var missingCheck in rowChecks.Where(x => x.Type == "None"))
             {
-                pendingFindings.AddRange(rowChecks
-                    .Where(x => x.Type == "None")
-                    .Select(x => CreateFinding(run.Id, x, results)));
+                var findingKey = $"{missingCheck.Record.Id}:None";
+                if (persistedFindingKeys.Add(findingKey))
+                    pendingFindings.Add(CreateFinding(run.Id, missingCheck, results));
             }
 
             // Persist the findings for each newly resolved unique identifier. Rows
@@ -182,26 +215,52 @@ public sealed class MedicationAuditService(
             }
         }
 
-        async Task FlushProgressAsync(bool force = false)
+        async Task<bool> FlushProgressAsync(bool force = false)
         {
-            if (force || pendingProgressWrites >= ProgressSaveBatchSize)
-            {
-                // Findings and progress become visible to polling clients together.
-                await PersistAvailableFindingsAsync();
-                await db.SaveChangesAsync(cancellationToken);
-                pendingProgressWrites = 0;
-            }
+            if (!force && pendingProgressWrites < ProgressSaveBatchSize)
+                return true;
+
+            await PersistAvailableFindingsAsync();
+            await db.SaveChangesAsync(cancellationToken);
+            pendingProgressWrites = 0;
+
+            var currentStatus = await db.MedicationAuditRuns.AsNoTracking()
+                .Where(x => x.Id == run.Id)
+                .Select(x => x.Status)
+                .FirstOrDefaultAsync(cancellationToken);
+
+            return currentStatus is not (MedicationAuditStatuses.Paused or MedicationAuditStatuses.Cancelled);
         }
 
         if (checks.Count == 0)
         {
             await PersistAvailableFindingsAsync();
             await db.SaveChangesAsync(cancellationToken);
-            return results;
+            var emptyRunStatus = await db.MedicationAuditRuns.AsNoTracking()
+                .Where(x => x.Id == run.Id)
+                .Select(x => x.Status)
+                .FirstOrDefaultAsync(cancellationToken);
+            return emptyRunStatus is not (MedicationAuditStatuses.Paused or MedicationAuditStatuses.Cancelled);
         }
 
-        var typesAndIds = checks.Values
-            .Select(x => (x.Type, x.NormalizedIdentifier))
+        var checksToResolve = checks
+            .Where(pair => !rowsByIdentifier.TryGetValue(pair.Key, out var matchingRows)
+                || matchingRows.Any(row => !persistedFindingKeys.Contains($"{row.Record.Id}:{row.Type}")))
+            .ToArray();
+
+        if (checksToResolve.Length == 0)
+        {
+            await PersistAvailableFindingsAsync();
+            await db.SaveChangesAsync(cancellationToken);
+            var finishedStatus = await db.MedicationAuditRuns.AsNoTracking()
+                .Where(x => x.Id == run.Id)
+                .Select(x => x.Status)
+                .FirstOrDefaultAsync(cancellationToken);
+            return finishedStatus is not (MedicationAuditStatuses.Paused or MedicationAuditStatuses.Cancelled);
+        }
+
+        var typesAndIds = checksToResolve
+            .Select(x => (x.Value.Type, x.Value.NormalizedIdentifier))
             .Distinct()
             .ToArray();
         var cacheTypes = typesAndIds.Select(x => x.Type).Distinct().ToArray();
@@ -212,7 +271,7 @@ public sealed class MedicationAuditService(
         var cacheByKey = cacheEntries.ToDictionary(CacheKey, StringComparer.Ordinal);
         var now = DateTime.UtcNow;
 
-        foreach (var (key, check) in checks)
+        foreach (var (key, check) in checksToResolve)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (check.InvalidFormatMessage is not null)
@@ -221,7 +280,8 @@ public sealed class MedicationAuditService(
                 resolvedKeys.Add(key);
                 run.ProcessedIdentifiers++;
                 pendingProgressWrites++;
-                await FlushProgressAsync();
+                if (!await FlushProgressAsync())
+                    return false;
                 continue;
             }
 
@@ -238,7 +298,8 @@ public sealed class MedicationAuditService(
                     resolvedKeys.Add(key);
                     run.ProcessedIdentifiers++;
                     pendingProgressWrites++;
-                    await FlushProgressAsync();
+                    if (!await FlushProgressAsync())
+                        return false;
                     continue;
                 }
                 catch (JsonException exception)
@@ -274,15 +335,16 @@ public sealed class MedicationAuditService(
             resolvedKeys.Add(key);
             run.ProcessedIdentifiers++;
             pendingProgressWrites++;
-            await FlushProgressAsync();
+            if (!await FlushProgressAsync())
+                return false;
             await Task.Delay(RequestSpacing, cancellationToken);
         }
 
-        // Persist the final partial batch, including the last cache entry and progress.
-        await PersistAvailableFindingsAsync();
-        await FlushProgressAsync(force: true);
+        // Persist the final partial batch, then honour pause/cancel before completion.
+        if (!await FlushProgressAsync(force: true))
+            return false;
 
-        return results;
+        return true;
     }
 
     private void SaveCache(
